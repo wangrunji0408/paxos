@@ -7,8 +7,6 @@ use std::fmt;
 
 pub struct Proposer {
     id: usize,
-    proposal_id: ProposalId,
-    value: Option<usize>,
     acceptors: Vec<Addr<Acceptor>>,
 }
 
@@ -18,12 +16,7 @@ impl Actor for Proposer {
 
 impl Proposer {
     pub fn new(id: usize, acceptors: Vec<Addr<Acceptor>>) -> Proposer {
-        Proposer {
-            id,
-            proposal_id: ProposalId::default(),
-            value: None,
-            acceptors,
-        }
+        Proposer { id, acceptors }
     }
 }
 
@@ -43,11 +36,32 @@ impl Handler<ProposeRequest> for Proposer {
     type Result = ResponseFuture<()>;
 
     fn handle(&mut self, msg: ProposeRequest, ctx: &mut Self::Context) -> Self::Result {
-        self.proposal_id.server_id = self.id;
-        self.proposal_id.timestamp += 1;
-        self.value = Some(msg.value);
+        self.handle(
+            Propose1 {
+                timestamp: 1,
+                value: msg.value,
+            },
+            ctx,
+        )
+    }
+}
+
+#[derive(Message, Debug)]
+#[rtype(result = "()")]
+struct Propose1 {
+    timestamp: usize,
+    value: usize,
+}
+
+impl Handler<Propose1> for Proposer {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, msg: Propose1, ctx: &mut Self::Context) -> Self::Result {
         let prepare = Prepare {
-            id: self.proposal_id,
+            id: ProposalId {
+                timestamp: msg.timestamp,
+                server_id: self.id,
+            },
         };
         info!("{:?}: => {:?}", self, prepare);
         let mut responses = self
@@ -60,20 +74,28 @@ impl Handler<ProposeRequest> for Proposer {
         let id = self.id;
         async move {
             let mut count = 0;
-            let mut propose = Propose2::default();
+            let mut max_accepted_proposal = ProposalId::default();
+            let mut max_accepted_value = None;
             while let Some(rsp) = responses.next().await {
                 if let Ok(rsp) = rsp {
                     info!(
                         "Proposer({}): <-{} {{ id: {:?}, value: {:?} }}",
                         id, rsp.id, rsp.accepted_proposal, rsp.accepted_value
                     );
-                    if rsp.accepted_proposal > propose.id {
-                        propose.id = rsp.accepted_proposal;
-                        propose.value = rsp.accepted_value;
+                    if !rsp.ok {
+                        continue;
+                    }
+                    if rsp.accepted_proposal > max_accepted_proposal {
+                        max_accepted_proposal = rsp.accepted_proposal;
+                        max_accepted_value = rsp.accepted_value;
                     }
                     count += 1;
                     if count >= majority {
-                        addr.try_send(propose).unwrap();
+                        addr.try_send(Propose2 {
+                            id: prepare.id,
+                            value: max_accepted_value.unwrap_or(msg.value),
+                        })
+                        .unwrap();
                         return;
                     }
                 } else if let Err(e) = rsp {
@@ -89,20 +111,16 @@ impl Handler<ProposeRequest> for Proposer {
 #[rtype(result = "()")]
 struct Propose2 {
     id: ProposalId,
-    value: Option<usize>,
+    value: usize,
 }
 
 impl Handler<Propose2> for Proposer {
     type Result = ResponseFuture<()>;
 
-    fn handle(&mut self, msg: Propose2, _ctx: &mut Self::Context) -> Self::Result {
-        if msg.value.is_some() {
-            self.proposal_id = msg.id;
-            self.value = msg.value;
-        }
+    fn handle(&mut self, msg: Propose2, ctx: &mut Self::Context) -> Self::Result {
         let propose = Propose {
-            id: self.proposal_id,
-            value: self.value.unwrap(),
+            id: msg.id,
+            value: msg.value,
         };
         info!("{:?}: => {:?}", self, propose);
         let mut responses = self
@@ -111,6 +129,7 @@ impl Handler<Propose2> for Proposer {
             .map(|acceptor| acceptor.send(propose.clone()))
             .collect::<FuturesUnordered<_>>();
         let majority = (responses.len() + 1) / 2;
+        let addr = ctx.address();
         let id = self.id;
         async move {
             let mut count = 0;
@@ -121,7 +140,11 @@ impl Handler<Propose2> for Proposer {
                         id, rsp.id, rsp.min_proposal
                     );
                     if rsp.min_proposal > propose.id {
-                        todo!("retry");
+                        addr.try_send(Propose1 {
+                            timestamp: rsp.min_proposal.timestamp + 1,
+                            value: propose.value,
+                        })
+                        .unwrap();
                         return;
                     }
                     count += 1;

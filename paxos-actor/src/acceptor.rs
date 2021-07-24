@@ -51,6 +51,7 @@ pub struct Prepare {
 #[derive(MessageResponse)]
 pub struct PrepareResponse {
     pub id: usize,
+    pub ok: bool,
     pub accepted_proposal: ProposalId,
     pub accepted_value: Option<usize>,
 }
@@ -59,7 +60,8 @@ impl Handler<Prepare> for Acceptor {
     type Result = PrepareResponse;
 
     fn handle(&mut self, msg: Prepare, _ctx: &mut Self::Context) -> Self::Result {
-        if msg.id > self.min_proposal {
+        let ok = msg.id > self.min_proposal;
+        if ok {
             info!("{:?}: <- {:?}", self, msg);
             self.min_proposal = msg.id;
         } else {
@@ -68,6 +70,7 @@ impl Handler<Prepare> for Acceptor {
         // TODO: persist
         PrepareResponse {
             id: self.id,
+            ok,
             accepted_proposal: self.accepted_proposal,
             accepted_value: self.accepted_value,
         }
